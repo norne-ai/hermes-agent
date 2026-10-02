@@ -29,6 +29,7 @@ from agent.vault_login_classifier import (  # noqa: E402
     ClassifiedLoginControl,
     LoginControl,
     build_fill_js,
+    build_inspection_js,
     classify_login_control,
     select_password_fill,
 )
@@ -233,7 +234,10 @@ class TestClassifier:
         assert "vaultSecret" not in js
         assert "data-vault-secret" not in js
         assert "elements[f.index]" not in js
-        assert "[data-hermes-vault-slot=" in js and "nonce + ':' + f.index" in js
+        # stamp resolution is nonce-bound (shadow-era shape: findStamped builds the
+        # selector from nonce + the fill's inspected index and searches every root)
+        assert '[data-hermes-vault-slot="' in js and "nonce + ':' + idx" in js
+        assert "findStamped(f.index)" in js
         assert 'f.token === "current-password" && el.type !== "password"' in js  # a password fill never lands in a text box
         assert js.index('removeAttribute("data-hermes-vault-slot")') > js.index("setter.set.call")
 
@@ -248,6 +252,23 @@ class TestClassifier:
         assert "window.location.origin" in js
         assert "origin_changed" in js
         assert js.index("origin_changed") < js.index("querySelectorAll")
+
+    def test_inspection_and_fill_pierce_open_shadow_roots(self) -> None:
+        # Ocado's Salesforce SSO login renders the password input inside an OPEN shadow root
+        # (verified live 2026-10-01); document queries alone never see it. Both scripts must
+        # traverse shadowRoot recursively — and the fill must resolve AND clean its stamps
+        # through those roots, since querySelector on document cannot reach stamped shadow nodes.
+        insp = build_inspection_js("nonce123")
+        fill = build_fill_js(
+            [{"index": 0, "token": "current-password", "value": "x"}],
+            expected_origin="https://sso.ocado.com",
+            nonce="nonce123",
+        )
+        for js in (insp, fill):
+            assert "el.shadowRoot" in js
+            assert "walk(document)" in js
+        assert 'root.getElementById ? root.getElementById(id)' in insp  # shadow id namespaces
+        assert "root.querySelectorAll(\"[data-hermes-vault-slot]\")" in fill  # marker cleanup pierces too
 
 
 # ---------------------------------------------------------------------------
