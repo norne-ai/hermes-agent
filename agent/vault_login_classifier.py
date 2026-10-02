@@ -222,7 +222,31 @@ def select_checkout_fills(classified: List[ClassifiedLoginControl], secret: Dict
 # Inspection stamps every input with ``<nonce>:<index>`` under a per-inspection attribute; the fill
 # script resolves targets by the stamp of ITS OWN inspection instead of re-querying by position, so
 # neither a DOM reflow nor a second inspection in between can redirect the password into another field.
+#
+# OPEN shadow roots are traversed recursively (Ocado/SSO login widgets render the password input in
+# one; verified 2026-10-01 it is OPEN, so piercing is possible — closed roots stay unreachable by
+# browser design). Stamps are element-local attributes, so they survive inside shadow trees; the
+# price is that both scripts resolve/marker elements through the collected root list rather than
+# through ``document`` queries, which do not pierce.
 INSPECTION_STAMP_ATTR = "data-hermes-vault-slot"
+
+# Shared by both templates: ``roots`` = document + every reachable shadowRoot (recursively);
+# ``elements``/``forms`` are collected in document order during the same walk.
+_SHADOW_WALK_JS = """  const roots = [document];
+  const elements = [];
+  const forms = [];
+  const seen = new Set();
+  const walk = (root) => {
+    if (seen.has(root)) return;
+    seen.add(root);
+    for (const el of root.querySelectorAll("*")) {
+      const tag = el.tagName;
+      if (tag === "INPUT" || tag === "SELECT") elements.push(el);
+      else if (tag === "FORM") forms.push(el);
+      if (el.shadowRoot) { roots.push(el.shadowRoot); walk(el.shadowRoot); }
+    }
+  };
+  walk(document);"""
 
 
 def build_otp_fills(otp_controls: List[ClassifiedLoginControl], code: str) -> List[Dict[str, Any]]:
@@ -242,13 +266,19 @@ def build_otp_fills(otp_controls: List[ClassifiedLoginControl], code: str) -> Li
 
 
 def build_inspection_js(nonce: str) -> str:
-    return _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE.replace("__NONCE__", json.dumps(nonce))
+    return (_LOGIN_CONTROL_INSPECTION_JS_TEMPLATE
+            .replace("__WALK__", _SHADOW_WALK_JS)
+            .replace("__NONCE__", json.dumps(nonce)))
 
 
 _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
   const nonce = __NONCE__;
-  const elements = Array.from(document.querySelectorAll("input, select"));
-  const forms = Array.from(document.forms);
+__WALK__
+  const byId = (node, id) => {
+    const root = node.getRootNode();
+    const inRoot = root && root.getElementById ? root.getElementById(id) : null;
+    return inRoot || document.getElementById(id);
+  };
   elements.forEach((element, index) => element.setAttribute("data-hermes-vault-slot", nonce + ":" + index));
   const out = elements.flatMap((element, index) => {
     if (element.disabled || element.readOnly) return [];
@@ -258,7 +288,7 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
     const labels = element.labels ? Array.from(element.labels, (l) => l.textContent || "") : [];
     const ariaText = (element.getAttribute("aria-labelledby") || "")
       .split(/\\s+/).filter(Boolean)
-      .map((id) => { const n = document.getElementById(id); return n ? (n.textContent || "") : ""; })
+      .map((id) => { const n = byId(element, id); return n ? (n.textContent || "") : ""; })
       .join(" ");
     const resolvedFormIndex = element.form ? forms.indexOf(element.form) : -1;
     return [{
@@ -297,6 +327,7 @@ def build_fill_js(fills: List[Dict[str, Any]], expected_origin: str, nonce: str 
         [{"index": f["index"], "token": f.get("token", "current-password"), "value": f["value"]} for f in fills]
     )
     return (_FILL_JS_TEMPLATE.replace("__EXPECTED_ORIGIN__", json.dumps(expected_origin))
+            .replace("__WALK__", _SHADOW_WALK_JS)
             .replace("__FILLS__", payload).replace("__NONCE__", json.dumps(nonce)))
 
 
@@ -309,9 +340,19 @@ _FILL_JS_TEMPLATE = """(() => {
   const nonce = __NONCE__;
   let filled = 0;
   const norm = (t) => String(t || "").trim().toLowerCase();
+__WALK__
+  const findStamped = (idx) => {
+    const sel = '[data-hermes-vault-slot="' + nonce + ':' + idx + '"]';
+    for (const root of roots) {
+      const hit = root.querySelector(sel);
+      if (hit) return hit;
+    }
+    return null;
+  };
   for (const f of fills) {
-    const el = document.querySelector('[data-hermes-vault-slot="' + nonce + ':' + f.index + '"]');
-    if (!el || (f.token === "current-password" && el.type !== "password")) continue;
+    const el = findStamped(f.index);
+    if (!el || !el.isConnected) continue;
+    if (f.token === "current-password" && el.type !== "password") continue;
     try {
       if (el.tagName === "SELECT") {
         const want = norm(f.value);
@@ -328,6 +369,8 @@ _FILL_JS_TEMPLATE = """(() => {
       if (el.value.length > 0) filled += 1;
     } catch (e) { /* skip */ }
   }
-  document.querySelectorAll("[data-hermes-vault-slot]").forEach((n) => n.removeAttribute("data-hermes-vault-slot"));
+  for (const root of roots) {
+    root.querySelectorAll("[data-hermes-vault-slot]").forEach((n) => n.removeAttribute("data-hermes-vault-slot"));
+  }
   return JSON.stringify({ filled });
 })()"""
